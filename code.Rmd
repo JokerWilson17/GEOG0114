@@ -1,0 +1,346 @@
+---
+title: "Seattle House Price Analysis"
+---
+
+```{r}
+#Load the dataset of sold houses and explore a bit
+sold<-read.csv("data/sold.csv")
+hist(sold$BEDS)
+hist(sold$BATHS)
+hist(sold$SQFT)
+hist(sold$LOTSIZE)
+hist(sold$YEARBUILT)
+hist(sold$HOA)
+#Outlier removal
+library(dplyr)
+sold=sold%>%filter(BEDS<=4)
+sold=sold%>%filter(BEDS>=2)
+sold=sold%>%filter(BATHS>=1)
+sold=sold%>%filter(SQFT<=3000)
+sold=sold%>%filter(LOTSIZE<=10000)
+```
+```{r}
+#Variable Mapping
+library(maptools)
+library(RColorBrewer)
+library(classInt)
+library(sp)
+library(rgeos)
+library(tmap)
+library(tmaptools)
+library(sf)
+library(rgdal)
+library(geojson)
+library(geojsonio)
+library(stringr)
+library(dbplyr)
+library(tidyverse)
+library(spatstat)
+Washington<-st_read("data/shapefile/WA_2010_voting_districts.shp")
+Seattle <- Washington %>%
+  dplyr::filter(str_detect(NAME10, "^SEA"))%>%
+  st_transform(., 2285)
+Seattle_sold <- sold %>%
+          st_as_sf(., coords = c("LONGITUDE", "LATITUDE"), 
+                                  crs = 4326) %>%
+          st_transform(., 2285)
+Joinfun <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=PRICE, name="sum_price")%>%
+  return(output)
+}
+Seattle_sold2 <- Joinfun(Seattle_sold, Seattle)
+Seattle_sold2 <- Seattle_sold2 %>%
+  group_by(., NAME10)%>%
+  summarise(`Sum price` = unique(sum_price))
+Price_sold<-st_intersection(Seattle_sold, Seattle_sold2)
+Price_sold_joined <- Seattle_sold2%>%
+  mutate(n = lengths(st_intersects(., Price_sold)))%>%
+  mutate("Average price"=`Sum price`/n)
+
+Joinfun2 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=PPSQFT, name="sum_PPSQFT")%>%
+  return(output)
+}
+Seattle_sold3 <- Joinfun2(Seattle_sold, Seattle)
+Seattle_sold3 <- Seattle_sold3 %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_PPSQFT` = unique(sum_PPSQFT))
+Price_sold2<-st_intersection(Seattle_sold, Seattle_sold3)
+Price_sold_joined2 <- Seattle_sold3%>%
+  mutate(n = lengths(st_intersects(., Price_sold2)))%>%
+  mutate("Price per square foot"=`sum_PPSQFT`/n)
+
+tmap_mode("plot")
+tm1 <- tm_shape(Price_sold_joined) + 
+  tm_fill("Average price",style="jenks",palette="Reds") +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)+
+  tm_credits("(a)Price of house", position=c(0.35,0), size=0.8)
+tm2 <- tm_shape(Price_sold_joined2) + 
+  tm_fill("Price per square foot",style="jenks",palette="Greens") +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)+
+  tm_credits("(b)Price per square foot", position=c(0.35,0), size=0.8)
+legend <- tm_shape(Price_sold_joined) +
+    tm_polygons("Average price",style="jenks",palette="Reds") +
+    tm_compass(north=0, position=c(0.2,0.8))+
+    tm_layout(legend.only = TRUE, legend.position=c(0.2,0.45),asp=0.1)+
+  tm_shape(Price_sold_joined2) +
+    tm_polygons("Price per square foot",style="jenks",palette="Greens")+tm_layout(legend.only = TRUE, legend.position=c(0.2,0.2),asp=0.1)+
+  tm_scale_bar(position=c(0.2,0.04), text.size=0.6)
+t1=tmap_arrange(tm1, tm2, legend, ncol=3)
+t1
+```
+```{r}
+#Linear Regression Model
+library(broom)
+model1 <- Seattle_sold %>%
+  lm(PRICE ~ BEDS+BATHS+SQFT+LOTSIZE+YEARBUILT+HOA,data=.)
+summary(model1)
+glance(model1)
+model_data <- model1 %>%
+         augment(., Seattle_sold)
+Seattle_sold <- Seattle_sold %>%
+  mutate(model1resids = residuals(model1))
+
+Joinfun3 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=model1resids, name="sum_model1resids")%>%
+  return(output)
+}
+Seattle_sold4 <- Joinfun3(Seattle_sold, Seattle)
+Seattle_sold4 <- Seattle_sold4 %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_model1resids` = unique(sum_model1resids))
+OLS<-st_intersection(Seattle_sold, Seattle_sold4)
+OLS_resids <- Seattle_sold4%>%
+  mutate(n = lengths(st_intersects(., OLS)))%>%
+  mutate("Average value of residuals (OLS)"=`sum_model1resids`/n)
+
+tmap_mode("plot")
+tm3<-tm_shape(OLS_resids) +
+  tm_fill("Average value of residuals (OLS)",style="jenks",palette="RdYlBu")+
+  tm_legend(show=TRUE, legend.position=c(0.68,0.05),asp=0.1, text.size=0.8)+
+  tm_borders(alpha = 1)+
+  tm_layout(frame=FALSE)+
+  tm_scale_bar(position=c(0.62,0.5), text.size=0.6)+
+  tm_compass(north=0, position=c(0.8,0.7))
+t2=tmap_arrange(tm3)
+t2
+```
+```{r}
+#Geographically Weighted Regression (GWR) Model
+library(spgwr)
+coordsW2 <- st_coordinates(Seattle_sold)
+Seattle_sold_GWR <- cbind(Seattle_sold,coordsW2)
+GWRbandwidth <- gwr.sel(PRICE ~ BEDS+BATHS+SQFT+LOTSIZE+YEARBUILT+HOA, 
+                  data = Seattle_sold_GWR, 
+                        coords=cbind(Seattle_sold_GWR$X, Seattle_sold_GWR$Y),
+                  adapt=T)
+GWRbandwidth
+gwr.model = gwr(PRICE ~ BEDS+BATHS+SQFT+LOTSIZE+YEARBUILT+HOA, 
+                  data = Seattle_sold_GWR, 
+                coords=cbind(Seattle_sold_GWR$X, Seattle_sold_GWR$Y), 
+                adapt=GWRbandwidth,
+                #matrix output
+                hatmatrix=TRUE,
+                #standard error
+                se.fit=TRUE)
+
+#print the results of the model
+gwr.model
+results <- as.data.frame(gwr.model$SDF)
+Seattle_sold_GWR2 <- Seattle_sold_GWR %>%
+  mutate(coefBEDS = results$BEDS,
+         coefBATHS = results$BATHS,
+         coefSQFT = results$SQFT,
+         coefLOTSIZE = results$LOTSIZE,
+         coefYEARBUILT = results$YEARBUILT,
+         coefHOA = results$HOA,
+         localR2 = results$localR2)
+
+GWR1 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=coefBEDS, name="sum_coefBEDS")%>%
+  return(output)
+}
+GWR1_statistics <- GWR1(Seattle_sold_GWR2, Seattle)
+GWR1_statistics <- GWR1_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_coefBEDS` = unique(sum_coefBEDS))
+GWR1_statistics1<-st_intersection(Seattle_sold_GWR2, GWR1_statistics)
+GWR1_statistics1 <- GWR1_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("BEDS Coefficient"=`sum_coefBEDS`/n)
+
+GWR2 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=coefBATHS, name="sum_coefBATHS")%>%
+  return(output)
+}
+GWR2_statistics <- GWR2(Seattle_sold_GWR2, Seattle)
+GWR2_statistics <- GWR2_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_coefBATHS` = unique(sum_coefBATHS))
+GWR2_statistics2<-st_intersection(Seattle_sold_GWR2, GWR2_statistics)
+GWR2_statistics2 <- GWR2_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("BATHS Coefficient"=`sum_coefBATHS`/n)
+
+GWR3 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=coefSQFT, name="sum_coefSQFT")%>%
+  return(output)
+}
+GWR3_statistics <- GWR3(Seattle_sold_GWR2, Seattle)
+GWR3_statistics <- GWR3_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_coefSQFT` = unique(sum_coefSQFT))
+GWR3_statistics3<-st_intersection(Seattle_sold_GWR2, GWR3_statistics)
+GWR3_statistics3 <- GWR3_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("SQFT Coefficient"=`sum_coefSQFT`/n)
+
+GWR4 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=coefLOTSIZE, name="sum_coefLOTSIZE")%>%
+  return(output)
+}
+GWR4_statistics <- GWR4(Seattle_sold_GWR2, Seattle)
+GWR4_statistics <- GWR4_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_coefLOTSIZE` = unique(sum_coefLOTSIZE))
+GWR4_statistics4<-st_intersection(Seattle_sold_GWR2, GWR4_statistics)
+GWR4_statistics4 <- GWR4_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("LOTSIZE Coefficient"=`sum_coefLOTSIZE`/n)
+
+GWR5 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=coefYEARBUILT, name="sum_coefYEARBUILT")%>%
+  return(output)
+}
+GWR5_statistics <- GWR5(Seattle_sold_GWR2, Seattle)
+GWR5_statistics <- GWR5_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_coefYEARBUILT` = unique(sum_coefYEARBUILT))
+GWR5_statistics5<-st_intersection(Seattle_sold_GWR2, GWR5_statistics)
+GWR5_statistics5 <- GWR5_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("YEARBUILT Coefficient"=`sum_coefYEARBUILT`/n)
+
+GWR6 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=coefHOA, name="sum_coefHOA")%>%
+  return(output)
+}
+GWR6_statistics <- GWR6(Seattle_sold_GWR2, Seattle)
+GWR6_statistics <- GWR6_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_coefHOA` = unique(sum_coefHOA))
+GWR6_statistics6<-st_intersection(Seattle_sold_GWR2, GWR6_statistics)
+GWR6_statistics6 <- GWR6_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("HOA Coefficient"=`sum_coefHOA`/n)
+
+GWR7 <- function(data1, data2){
+output<- data1%>%
+  st_join(data2,.) %>%
+  add_count(NAME10, wt=localR2, name="sum_localR2")%>%
+  return(output)
+}
+GWR7_statistics <- GWR7(Seattle_sold_GWR2, Seattle)
+GWR7_statistics <- GWR7_statistics %>%
+  group_by(., NAME10)%>%
+  summarise(`sum_localR2` = unique(sum_localR2))
+GWR7_statistics7<-st_intersection(Seattle_sold_GWR2, GWR7_statistics)
+GWR7_statistics7 <- GWR7_statistics%>%
+  mutate(n = lengths(st_intersects(., Seattle_sold_GWR2)))%>%
+  mutate("localR2"=`sum_localR2`/n)
+
+tmap_mode("plot")
+g1 <- tm_shape(GWR1_statistics1) + 
+  tm_fill("BEDS Coefficient",style="quantile",palette="Blues",midpoint = NA ) +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+g2 <- tm_shape(GWR2_statistics2) + 
+  tm_fill("BATHS Coefficient",style="quantile",palette="Blues",midpoint = NA ) +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+g3 <- tm_shape(GWR3_statistics3) + 
+  tm_fill("SQFT Coefficient",style="quantile",palette="Blues",midpoint = NA ) +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+g4 <- tm_shape(GWR4_statistics4) + 
+  tm_fill("LOTSIZE Coefficient",style="quantile",palette="Blues",midpoint = NA ) +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+g5 <- tm_shape(GWR5_statistics5) + 
+  tm_fill("YEARBUILT Coefficient",style="quantile",palette="Blues",midpoint = NA ) +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+g6 <- tm_shape(GWR6_statistics6) + 
+  tm_fill("HOA Coefficient",style="quantile",palette="Blues",midpoint = NA ) +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+g7 <- tm_shape(GWR7_statistics7) + 
+  tm_fill("localR2",style="jenks",palette="Spectral") +
+  tm_borders(alpha = 0)+ 
+  tm_legend(show=FALSE)+
+  tm_layout(frame=FALSE)
+l1 <- tm_shape(GWR1_statistics1) +
+    tm_polygons("BEDS Coefficient",style="quantile",palette="Blues",midpoint = NA) +
+    tm_layout(legend.only = TRUE, legend.position=c(0,0.1),asp=0.1)
+l2 <-tm_shape(GWR2_statistics2) +
+    tm_polygons("BATHS Coefficient",style="quantile",palette="Blues",midpoint = NA)+tm_layout(legend.only = TRUE, legend.position=c(0,0.1),asp=0.1)
+l3 <- tm_shape(GWR3_statistics3) +
+    tm_polygons("SQFT Coefficient",style="quantile",palette="Blues",midpoint = NA)+tm_layout(legend.only = TRUE, legend.position=c(0,0.1),asp=0.1)
+l4 <-tm_shape(GWR4_statistics4) +
+    tm_polygons("LOTSIZE Coefficient",style="quantile",palette="Blues",midpoint = NA)+tm_layout(legend.only = TRUE, legend.position=c(0,0.1),asp=0.1)
+l5 <-tm_shape(GWR5_statistics5) +
+    tm_polygons("YEARBUILT Coefficient",style="quantile",palette="Blues",midpoint = NA)+tm_layout(legend.only = TRUE, legend.position=c(0,0.1),asp=0.1)
+l6 <-tm_shape(GWR6_statistics6) +
+    tm_polygons("HOA Coefficient",style="quantile",palette="Blues",midpoint = NA)+tm_layout(legend.only = TRUE, legend.position=c(0,0.15),asp=0.1)
+l7 <-tm_shape(GWR7_statistics7) +
+    tm_polygons("localR2",style="jenks",palette="Spectral")+tm_layout(legend.only = TRUE, legend.position=c(0,0.1),asp=0.1)+tm_compass(north=0, position=c(0.55,0.4))+
+    tm_scale_bar(position=c(0.5,0))
+t3=tmap_arrange(g1,l1,g2,l2,g3,l3,g4,l4,g5,l5,g6,l6,g7,l7,ncol=4)
+t3
+```
+```{r}
+#heatmap of POIS
+OSM<-st_read("data/POI/gis_osm_pois_free_1.shp")
+OSM <- st_transform(OSM, 2285)
+OSM2 <- st_coordinates(OSM)
+OSM <- cbind(OSM,OSM2)
+window <- as.owin(Seattle)
+OSM<- OSM %>%
+  as(., 'Spatial')
+OSM.ppp <- ppp(x=OSM@coords[,1],
+                          y=OSM@coords[,2],
+                          window=window)
+OSM.ppp %>%
+  density(., sigma=1000) %>%
+  plot(main="Kernel density of POI in Seattle")
+
+```
+
